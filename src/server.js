@@ -8,6 +8,8 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
+import { createAuth } from "./auth.js";
+
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
 for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKEN", "CONFIG_PATH"]) {
@@ -271,6 +273,11 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// Wrapper authentication shared by /setup and the dashboard proxy — see src/auth.js
+// for why a session cookie (and not Basic auth alone) is needed here.
+const auth = createAuth({ password: SETUP_PASSWORD, gatewayToken: OPENCLAW_GATEWAY_TOKEN });
+const authorizeRequest = (req) => auth.authorize(req);
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -279,19 +286,9 @@ function requireSetupAuth(req, res, next) {
       .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
-  }
+  const result = authorizeRequest(req);
+  if (!result) return auth.deny(req, res);
+  if (result === "password") auth.issueSession(req, res);
   return next();
 }
 
@@ -1334,20 +1331,10 @@ proxy.on("error", (err, _req, res) => {
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
-  if (!SETUP_PASSWORD) return next(); // no password configured → open
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Invalid password");
-  }
+
+  const result = authorizeRequest(req); // "open" when no SETUP_PASSWORD is configured
+  if (!result) return auth.deny(req, res);
+  if (result === "password") auth.issueSession(req, res);
   return next();
 }
 
@@ -1356,7 +1343,13 @@ function requireDashboardAuth(req, res, next) {
 // cannot set custom Authorization headers for WebSocket connections, so we inject
 // the token into proxied requests at the wrapper level.
 function attachGatewayAuthHeader(req) {
-  if (!req?.headers?.authorization && OPENCLAW_GATEWAY_TOKEN) {
+  if (!req?.headers || !OPENCLAW_GATEWAY_TOKEN) return;
+  const header = req.headers.authorization || "";
+  const scheme = header.split(" ")[0]?.toLowerCase();
+  // The browser replays cached Basic credentials on every same-origin request.
+  // They are wrapper-level only and meaningless to the gateway, so replace them
+  // instead of forwarding them (which made the gateway reject the request).
+  if (!header || scheme === "basic") {
     req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
   }
 }
@@ -1460,9 +1453,15 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
-  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
-  // The gateway authenticates at the protocol layer and we inject the gateway token below.
+  // Note: browsers cannot attach arbitrary HTTP headers in WebSocket handshakes,
+  // so no header-based password check happens here. They do send cookies, so the
+  // session issued after login (or a gateway token from non-browser clients) is
+  // what authorizes the upgrade; without it we would be handing anonymous callers
+  // an injected admin token below.
+  if (!authorizeRequest(req)) {
+    socket.destroy();
+    return;
+  }
 
   if (!isConfigured()) {
     socket.destroy();
